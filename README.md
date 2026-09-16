@@ -16,6 +16,7 @@ Appen är en **PWA** (progressive web app) — den installeras direkt från webb
 
 ### iPhone (Safari)
 
+[Länk till sidan](http://clab252.github.io/ipscfordringar)
 1. Öppna sidans länk i **Safari** (måste vara Safari, andra webbläsare på iPhone stöder inte det här).
 2. Tryck på dela-ikonen (fyrkanten med pilen uppåt) längst ner i mitten.
 3. Skrolla ner i menyn och välj **"Lägg till på hemskärmen"**.
@@ -23,7 +24,7 @@ Appen är en **PWA** (progressive web app) — den installeras direkt från webb
 5. En app-ikon dyker upp på hemskärmen — öppna appen därifrån som vilken app som helst.
 
 ### Android (Chrome)
-
+[Länk till sidan](http://clab252.github.io/ipscfordringar)
 1. Öppna sidans länk i **Chrome**.
 2. Tryck på menyn (⋮) uppe i högra hörnet.
 3. Välj **"Lägg till på startskärmen"** eller **"Installera app"** (texten skiljer sig lite mellan Chrome-versioner).
@@ -33,13 +34,3 @@ Appen är en **PWA** (progressive web app) — den installeras direkt från webb
 När appen väl är installerad fungerar den offline och sparar allt du matar in lokalt på just den telefonen.
 
 ---
-
-## För den som uppdaterar appen
-
-Filerna i det här repot ligger i roten och laddas upp direkt via GitHub Pages. Vid en uppdatering:
-
-1. Ladda upp de ändrade filerna (skriver över de gamla).
-2. Höj versionsnumret i `service-worker.js` (`CACHE_NAME`) — annars kan redan installerade appar fortsätta visa en cachad, gammal version ett tag.
-3. Byter du `icon-192.png`/`icon-512.png`: en redan installerad hemskärmsikon uppdateras inte alltid automatiskt — det kan krävas att man tar bort appen och lägger till den på nytt.
-
-Se GitHub-repots **Settings → Pages** för webbadressen till den driftsatta appen.
