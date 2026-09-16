@@ -8,7 +8,7 @@ Ett digitalt poängkort för IPSC-fordringarna (PCC, Handgun, Shotgun, Rifle). I
 - Håller koll på flera skyttar samtidigt, var och en med sina egna serier per gren och avstånd
 - Bygger en sammanfattning i slutet av dagen — vem som klarat vad — klar att kopiera eller mejla
 
-![Skärmdump av appen](screenshot.png)
+<img src="screenshot.png" alt="Skärmdump av appen" width="320">
 
 ## Installera på din telefon
 
