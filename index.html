@@ -206,6 +206,27 @@
   .pcc-btn-secondary.confirm-danger{ border-color:var(--danger); color:var(--danger); font-weight:700; }
   .pcc-clearrow{ margin:14px 0; }
   .pcc-clearrow button{ width:100%; }
+
+  .pcc-ble-section{
+    margin:14px 0; padding:10px 12px; background:var(--surface); border:1px solid var(--border);
+    border-radius:9px; display:flex; flex-direction:column; gap:8px;
+  }
+  .pcc-ble-row{ display:flex; align-items:center; gap:8px; }
+  .pcc-ble-dot{ width:8px; height:8px; border-radius:50%; background:var(--text-muted); flex-shrink:0; }
+  .pcc-ble-dot.on{ background:var(--good); }
+  .pcc-ble-dot.pulse{ animation:pcc-pulse 1s ease-in-out infinite; }
+  @keyframes pcc-pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.3; } }
+  .pcc-ble-status{ font-size:12px; color:var(--text-muted); flex:1; line-height:1.4; }
+  .pcc-ble-status.good{ color:var(--good); }
+  .pcc-ble-status.err{ color:var(--danger); }
+  .pcc-ble-btn{ width:100%; background:var(--accent); border:none; color:var(--accent-ink);
+    border-radius:9px; padding:11px 10px; font-family:inherit; font-size:13px; font-weight:700; cursor:pointer; }
+  .pcc-ble-actions{ display:flex; gap:8px; }
+  .pcc-ble-actions button{ flex:1; }
+  .pcc-ble-last{ font-size:11px; color:var(--text-muted); }
+  .pcc-ble-last.good{ color:var(--good); }
+  .pcc-ble-last.live{ color:var(--accent); font-weight:600; }
+  .pcc-ble-sessions{ display:flex; flex-direction:column; gap:4px; max-height:160px; overflow-y:auto; padding-right:2px; }
   .pcc-btn-primary{
     flex:1; background:var(--accent); border:none; color:var(--accent-ink);
     border-radius:9px; padding:11px 10px; font-family:inherit; font-size:13px; font-weight:700;
@@ -415,6 +436,15 @@ if('serviceWorker' in navigator){
     disc.legendList.forEach(function(l){ disc.legendMap[l.code] = l.pts; });
   });
 
+  // ---- BLE (Smart Shot Timer, API v3.2) ----
+  var BLE_SERVICE_UUID   = '7520ffff-14d2-4cda-8b6b-697c554c9311';
+  var BLE_CHAR_COMMAND   = '75200000-14d2-4cda-8b6b-697c554c9311';
+  var BLE_CHAR_EVENT     = '75200001-14d2-4cda-8b6b-697c554c9311';
+  var BLE_CHAR_UNIX_TIME = '75200006-14d2-4cda-8b6b-697c554c9311';
+  var BLE_CHAR_API_VER   = '7520fffe-14d2-4cda-8b6b-697c554c9311';
+  var BLE_EVENT = { SESSION_STARTED:0x00, SESSION_SUSPENDED:0x01, SESSION_RESUMED:0x02, SESSION_STOPPED:0x03, SHOT_DETECTED:0x04, SESSION_SET_BEGIN:0x05 };
+  var BLE_CMD = { SESSION_START:0x00, SESSION_SUSPEND:0x01, SESSION_RESUME:0x02, SESSION_STOP:0x03 };
+
   var STORAGE_KEY = 'pcc-shooters-v3';
   var APP_VERSION = '0.1';
   var toastTimer = null;
@@ -445,7 +475,24 @@ if('serviceWorker' in navigator){
     pendingClearSeries: false,
     descExpanded: false,
     exportOpen: false,
-    loaded: false
+    loaded: false,
+    ble: {
+      supported: !!(navigator.bluetooth),
+      connecting: false,
+      connected: false,
+      name: '',
+      status: '',
+      statusKind: '', // '', 'good', 'err'
+      sessionLines: [], // { display: '', imported: false, done: false } — en rad per timerstart
+      pendingShotMs: null,
+      pendingShotNum: null,
+      shotCount: 0,
+      sessId: null,
+      device: null,
+      server: null,
+      eventChar: null,
+      commandChar: null
+    }
   };
 
   function getActiveShooter(){
@@ -751,6 +798,229 @@ if('serviceWorker' in navigator){
     }
   };
 
+  // ---- BLE (Smart Shot Timer) ----
+  function bleSetStatus(msg, kind){
+    state.ble.status = msg || '';
+    state.ble.statusKind = kind || '';
+    render();
+  }
+
+  // Skriver raw (centisekunder) till en serie-rad. Om existingRowIdx pekar på en rad som redan
+  // hör till den här sessionen skrivs samma rad över (t.ex. om man fortsätter efter en paus och
+  // skjuter fler skott); annars används nästa tomma rad / en ny rad läggs till.
+  function bleImportShotRaw(raw, existingRowIdx){
+    var list = getActiveList();
+    if(!list){
+      showToast('Välj en skytt innan du skjuter');
+      return null;
+    }
+    var isNew = (existingRowIdx === null || existingRowIdx === undefined || !list[existingRowIdx]);
+    var idx;
+    if(!isNew){
+      idx = existingRowIdx;
+    } else {
+      idx = -1;
+      for(var i=0;i<list.length;i++){ if(!list[i].time){ idx = i; break; } }
+      if(idx === -1){
+        idx = list.length;
+        list.push({time:'', t1:null, t2:null});
+      }
+    }
+    list[idx].time = raw;
+    if(isNew) state.ble.shotCount++;
+    persistShooters();
+    return { display: formatTimeDisplay(raw), idx: idx };
+  }
+
+  // Returnerar den pågående (senaste, ej avslutade) radens session-objekt, skapar en ny rad
+  // om ingen finns än (t.ex. om appen missade ett SESSION_STARTED).
+  function bleCurrentSessionLine(){
+    var lines = state.ble.sessionLines;
+    if(lines.length === 0 || lines[lines.length - 1].done){
+      lines.push({ display: '', raw: '', rowIdx: null, imported: false, done: false });
+    }
+    return lines[lines.length - 1];
+  }
+
+  function bleHandleEvent(evt){
+    try{
+      var dv = evt.target.value; // DataView
+      if(!dv || dv.byteLength < 2) return;
+      var eventId = dv.getUint8(1);
+      switch(eventId){
+        case BLE_EVENT.SESSION_STARTED:
+          state.ble.sessId = dv.getUint32(2, false);
+          // Ny rad för den här sessionen — tom tills första skottet
+          state.ble.sessionLines.push({ display: '', raw: '', rowIdx: null, imported: false, done: false });
+          bleSetStatus('Session startad — väntar på skott…', 'good');
+          break;
+        case BLE_EVENT.SESSION_SET_BEGIN:
+          bleSetStatus('Klart — skjut!', 'good');
+          break;
+        case BLE_EVENT.SESSION_SUSPENDED: {
+          // Timern går till "fortsätt / starta"-läge (dvs den fysiska "stopp"-knappen). Det är HÄR
+          // vi ska uppdatera raden med senaste skottets tid — inte när man senare backar till
+          // startsidan (det skickar inget SESSION_STOPPED-event på alla timers).
+          var line = bleCurrentSessionLine();
+          if(line.raw){
+            var res = bleImportShotRaw(line.raw, line.rowIdx);
+            if(res){
+              line.display = res.display;
+              line.rowIdx = res.idx;
+              line.imported = true;
+              bleSetStatus('Pausad — ' + res.display + 's importerad (fortsätt eller avsluta på timern)', 'good');
+            } else {
+              bleSetStatus('Pausad — kunde inte importera (ingen skytt vald)', 'err');
+            }
+          } else {
+            bleSetStatus('Pausad — inga skott ännu', '');
+          }
+          // OBS: markeras INTE som "done" här — sessionen kan fortsätta (Continue), och
+          // skjuts fler skott ska samma rad uppdateras igen vid nästa paus/stopp.
+          render();
+          break;
+        }
+        case BLE_EVENT.SESSION_RESUMED:
+          bleSetStatus('Session återupptagen — väntar på fler skott…', 'good');
+          break;
+        case BLE_EVENT.SESSION_STOPPED: {
+          // Fallback: om timern ändå skickar ett riktigt stopp (t.ex. reset till startsidan
+          // eller om SUSPENDED av någon anledning missades), importera/uppdatera en sista gång
+          // och lås raden så den inte uppdateras mer.
+          var stopLine = bleCurrentSessionLine();
+          if(stopLine.raw){
+            var stopRes = bleImportShotRaw(stopLine.raw, stopLine.rowIdx);
+            if(stopRes){
+              stopLine.display = stopRes.display;
+              stopLine.rowIdx = stopRes.idx;
+              stopLine.imported = true;
+            }
+          }
+          stopLine.done = true;
+          bleSetStatus(stopLine.imported ? ('Session avslutad — ' + stopLine.display + 's') : 'Session avslutad — inga skott', stopLine.imported ? 'good' : '');
+          render();
+          break;
+        }
+        case BLE_EVENT.SHOT_DETECTED: {
+          var shotNum = dv.getUint16(6, false);
+          var shotTimeMs = dv.getUint32(8, false);
+          var raw = String(Math.max(1, Math.round(shotTimeMs / 10))); // centisekunder, samma format som manuell inmatning
+          // Spara bara senaste skottet på den pågående sessionens rad — raden i tabellen
+          // skrivs/uppdateras först när timern pausas eller stoppas.
+          var curLine = bleCurrentSessionLine();
+          curLine.raw = raw;
+          curLine.display = formatTimeDisplay(raw);
+          curLine.imported = false; // väntar på att synkas till tabellen vid paus/stopp
+          bleSetStatus('Skott ' + (shotNum + 1) + ' registrerat (uppdateras vid paus/stopp)', '');
+          break;
+        }
+        default:
+          // Okänd/oväntad händelse — visa den så det går att felsöka om timern beter sig annorlunda
+          bleSetStatus('Okänd händelse mottagen (id ' + eventId + ')', '');
+      }
+    }catch(err){
+      console.error('BLE event error', err);
+      bleSetStatus('Fel vid tolkning av timerdata: ' + (err && err.message ? err.message : err), 'err');
+    }
+  }
+
+
+  function bleHandleDisconnect(){
+    state.ble.connected = false;
+    state.ble.connecting = false;
+    state.ble.device = null;
+    state.ble.server = null;
+    state.ble.eventChar = null;
+    state.ble.commandChar = null;
+    state.ble.pendingShotMs = null;
+    state.ble.pendingShotNum = null;
+    // Om en session var igång när uppkopplingen bröts, markera dess rad som avslutad
+    // (utan att importera — det görs bara vid ett riktigt STOP-kommando från timern)
+    var lines = state.ble.sessionLines;
+    if(lines.length && !lines[lines.length - 1].done){
+      lines[lines.length - 1].done = true;
+    }
+    bleSetStatus('Frånkopplad', '');
+  }
+
+  window.pccBleConnect = async function(){
+    if(!navigator.bluetooth){
+      bleSetStatus('Web Bluetooth stöds inte i den här webbläsaren (använd Chrome på Android).', 'err');
+      return;
+    }
+    if(!getActiveList()){
+      showToast('Välj en skytt först');
+      return;
+    }
+    state.ble.connecting = true;
+    bleSetStatus('Söker efter tidtagare…', '');
+    try{
+      var device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [BLE_SERVICE_UUID] }],
+        optionalServices: [BLE_SERVICE_UUID]
+      });
+      state.ble.device = device;
+      state.ble.name = device.name || 'SG Timer';
+      device.addEventListener('gattserverdisconnected', bleHandleDisconnect);
+
+      bleSetStatus('Ansluter till ' + state.ble.name + '…', '');
+      var server = await device.gatt.connect();
+      state.ble.server = server;
+
+      var service = await server.getPrimaryService(BLE_SERVICE_UUID);
+
+      var eventChar = await service.getCharacteristic(BLE_CHAR_EVENT);
+      await eventChar.startNotifications();
+      eventChar.addEventListener('characteristicvaluechanged', bleHandleEvent);
+      state.ble.eventChar = eventChar;
+
+      try{
+        state.ble.commandChar = await service.getCharacteristic(BLE_CHAR_COMMAND);
+      }catch(e){ /* valfritt */ }
+
+      // Synka klockan på tidtagaren med telefonens tid
+      try{
+        var unixChar = await service.getCharacteristic(BLE_CHAR_UNIX_TIME);
+        var buf = new ArrayBuffer(4);
+        new DataView(buf).setUint32(0, Math.floor(Date.now() / 1000), false);
+        await unixChar.writeValue(buf);
+      }catch(e){ /* valfritt, fortsätt ändå */ }
+
+      state.ble.connecting = false;
+      state.ble.connected = true;
+      state.ble.shotCount = 0;
+      state.ble.sessionLines = [];
+      state.ble.pendingShotMs = null;
+      state.ble.pendingShotNum = null;
+      bleSetStatus('Ansluten till ' + state.ble.name + ' — redo att ta emot skott', 'good');
+    }catch(err){
+      state.ble.connecting = false;
+      state.ble.connected = false;
+      if(err && err.name === 'NotFoundError'){
+        bleSetStatus('Ingen enhet vald', '');
+      } else {
+        bleSetStatus('Anslutning misslyckades: ' + (err && err.message ? err.message : err), 'err');
+      }
+    }
+  };
+
+  window.pccBleSendCommand = async function(cmdId){
+    if(!state.ble.commandChar) return;
+    try{
+      await state.ble.commandChar.writeValue(new Uint8Array([0x01, cmdId]));
+    }catch(e){
+      bleSetStatus('Kunde inte skicka kommando: ' + (e && e.message ? e.message : e), 'err');
+    }
+  };
+
+  window.pccBleDisconnect = function(){
+    if(state.ble.device && state.ble.device.gatt && state.ble.device.gatt.connected){
+      state.ble.device.gatt.disconnect();
+    } else {
+      bleHandleDisconnect();
+    }
+  };
+
   window.pccToggleExport = function(){
     state.exportOpen = !state.exportOpen;
     render();
@@ -901,6 +1171,62 @@ if('serviceWorker' in navigator){
       '<div class="pcc-addrow" id="pcc-addrow-wrap">' + addBtnInner + '</div>';
   }
 
+  function bleSessionLinesHtml(){
+    var lines = state.ble.sessionLines;
+    if(!lines.length){
+      return '<div class="pcc-ble-last">Ingen session ännu — tryck start på timern.</div>';
+    }
+    var rows = lines.map(function(line, idx){
+      var value = line.display ? escapeHtml(line.display) + 's' : '–';
+      var cls = 'pcc-ble-last' + (line.imported ? ' good' : (!line.done ? ' live' : ''));
+      var note;
+      if(!line.done){
+        note = line.imported ? ' (pausad — fortsätt eller avsluta)' : ' (pågår…)';
+      } else {
+        note = line.imported ? '' : ' (inga skott)';
+      }
+      return '<div class="' + cls + '">Skjutning ' + (idx + 1) + ': <span class="mono">' + value + '</span>' + note + '</div>';
+    }).join('');
+    return '<div class="pcc-ble-sessions">' + rows + '</div>';
+  }
+
+  function bleSectionHtml(){
+    var ble = state.ble;
+    if(!ble.supported){
+      return '<div class="pcc-ble-section"><div class="pcc-ble-status err">Bluetooth-anslutning till tidtagare stöds inte i den här webbläsaren (använd Chrome på Android).</div></div>';
+    }
+    var statusCls = 'pcc-ble-status' + (ble.statusKind ? ' ' + ble.statusKind : '');
+    var dotCls = 'pcc-ble-dot' + (ble.connected ? ' on' : '') + (ble.connecting ? ' pulse' : '');
+
+    if(!ble.connected){
+      return '' +
+        '<div class="pcc-ble-section">' +
+          '<button type="button" class="pcc-ble-btn" onclick="pccBleConnect()" ' + (ble.connecting?'disabled':'') + '>' +
+            (ble.connecting ? 'Ansluter…' : '⏱ Anslut till Timer') +
+          '</button>' +
+          (ble.status ? '<div class="pcc-ble-row"><div class="' + dotCls + '"></div><div class="' + statusCls + '">' + escapeHtml(ble.status) + '</div></div>' : '') +
+        '</div>';
+    }
+
+    return '' +
+      '<div class="pcc-ble-section">' +
+        '<div class="pcc-ble-row">' +
+          '<div class="' + dotCls + '"></div>' +
+          '<div class="' + statusCls + '">' + escapeHtml(ble.status || ('Ansluten till ' + ble.name)) + '</div>' +
+        '</div>' +
+        bleSessionLinesHtml() +
+        (ble.commandChar ? (
+          '<div class="pcc-ble-actions">' +
+            '<button type="button" class="pcc-btn-secondary" onclick="pccBleSendCommand(' + BLE_CMD.SESSION_START + ')">Starta</button>' +
+            '<button type="button" class="pcc-btn-secondary" onclick="pccBleSendCommand(' + BLE_CMD.SESSION_STOP + ')">Stoppa</button>' +
+          '</div>'
+        ) : '') +
+        '<div class="pcc-ble-actions">' +
+          '<button type="button" class="pcc-btn-secondary" onclick="pccBleDisconnect()">Koppla från (' + ble.shotCount + ' skott importerade)</button>' +
+        '</div>' +
+      '</div>';
+  }
+
   function shooterStatusListHtml(stageObj){
     if(!state.shooters.length) return '<div class="pcc-empty">Inga skyttar tillagda än.</div>';
     var legendMap = DISCIPLINES[state.discipline].legendMap;
@@ -1037,7 +1363,8 @@ if('serviceWorker' in navigator){
           '<button type="button" class="pcc-btn-secondary' + (state.pendingClearSeries?' confirm-danger':'') + '" onclick="pccClearAllSeries()">' +
             (state.pendingClearSeries ? 'Säker? Tryck igen för att radera allt' : 'Rensa alla serier (' + escapeHtml(sh.name) + ', ' + disc.title + ' ' + stageObj.label + ')') +
           '</button>' +
-        '</div>';
+        '</div>' +
+        bleSectionHtml();
     }
 
     html +=
