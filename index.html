@@ -445,8 +445,16 @@ if('serviceWorker' in navigator){
   var BLE_EVENT = { SESSION_STARTED:0x00, SESSION_SUSPENDED:0x01, SESSION_RESUMED:0x02, SESSION_STOPPED:0x03, SHOT_DETECTED:0x04, SESSION_SET_BEGIN:0x05 };
   var BLE_CMD = { SESSION_START:0x00, SESSION_SUSPEND:0x01, SESSION_RESUME:0x02, SESSION_STOP:0x03 };
 
+  // ---- SpecialPie M1A2 (reverse-engineerad 2026-09-20) ----
+  // Ram: F8 F9 [innehåll] F9 F8. Kontrollmeddelande (2 byte): [typ, sessions-id] — 0x34=start, 0x18=stopp.
+  // Skottmeddelande (6 byte): [0x36, 0x00, sekunder, hundradelar, skottnr, sessions-id].
+  var PIE_SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
+  var PIE_CHAR_NOTIFY  = '0000fff1-0000-1000-8000-00805f9b34fb';
+  var PIE_CTRL = { START:0x34, STOP:0x18 };
+  var PIE_SHOT_TAG = 0x36;
+
   var STORAGE_KEY = 'pcc-shooters-v3';
-  var APP_VERSION = '0.2';
+  var APP_VERSION = '0.3';
   var toastTimer = null;
   var pendingDeleteTimer = null;
   var pendingClearTimer = null;
@@ -480,6 +488,7 @@ if('serviceWorker' in navigator){
       supported: !!(navigator.bluetooth),
       connecting: false,
       connected: false,
+      protocol: null, // 'sg' | 'pie'
       name: '',
       status: '',
       statusKind: '', // '', 'good', 'err'
@@ -842,7 +851,7 @@ if('serviceWorker' in navigator){
     return lines[lines.length - 1];
   }
 
-  function bleHandleEvent(evt){
+  function bleHandleSgEvent(evt){
     try{
       var dv = evt.target.value; // DataView
       if(!dv || dv.byteLength < 2) return;
@@ -924,10 +933,59 @@ if('serviceWorker' in navigator){
     }
   }
 
+  // ---- SpecialPie M1A2 ----
+  function bleHandlePieEvent(evt){
+    try{
+      var dv = evt.target.value;
+      if(!dv || dv.byteLength < 6) return;
+      var bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+      if(bytes[0] !== 0xF8 || bytes[1] !== 0xF9) return; // okänt ramformat, ignorera
+      var payload = bytes.slice(2, bytes.length - 2);
+      if(payload.length === 2){
+        var type = payload[0];
+        if(type === PIE_CTRL.START){
+          state.ble.sessionLines.push({ display: '', raw: '', rowIdx: null, imported: false, done: false });
+          bleSetStatus('Session startad — väntar på skott…', 'good');
+        } else if(type === PIE_CTRL.STOP){
+          var stopLine = bleCurrentSessionLine();
+          if(stopLine.raw){
+            var stopRes = bleImportShotRaw(stopLine.raw, stopLine.rowIdx);
+            if(stopRes){
+              stopLine.display = stopRes.display;
+              stopLine.rowIdx = stopRes.idx;
+              stopLine.imported = true;
+            }
+          }
+          stopLine.done = true;
+          bleSetStatus(stopLine.imported ? ('Session avslutad — ' + stopLine.display + 's') : 'Session avslutad — inga skott', stopLine.imported ? 'good' : '');
+          render();
+        } else {
+          bleSetStatus('Okänd PIE-kontrollhändelse (typ 0x' + type.toString(16) + ')', '');
+        }
+      } else if(payload.length === 6 && payload[0] === PIE_SHOT_TAG){
+        var seconds = payload[2];
+        var hundredths = payload[3];
+        var shotNum = payload[4];
+        var raw = String(seconds * 100 + hundredths);
+        var curLine = bleCurrentSessionLine();
+        curLine.raw = raw;
+        curLine.display = formatTimeDisplay(raw);
+        curLine.imported = false;
+        bleSetStatus('Skott ' + shotNum + ' registrerat (uppdateras vid stopp)', '');
+      } else {
+        bleSetStatus('Okänt PIE-meddelande mottaget', '');
+      }
+    }catch(err){
+      console.error('PIE BLE event error', err);
+      bleSetStatus('Fel vid tolkning av timerdata: ' + (err && err.message ? err.message : err), 'err');
+    }
+  }
+
 
   function bleHandleDisconnect(){
     state.ble.connected = false;
     state.ble.connecting = false;
+    state.ble.protocol = null;
     state.ble.device = null;
     state.ble.server = null;
     state.ble.eventChar = null;
@@ -956,35 +1014,49 @@ if('serviceWorker' in navigator){
     bleSetStatus('Söker efter tidtagare…', '');
     try{
       var device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [BLE_SERVICE_UUID] }],
-        optionalServices: [BLE_SERVICE_UUID]
+        filters: [{ services: [BLE_SERVICE_UUID] }, { services: [PIE_SERVICE_UUID] }],
+        optionalServices: [BLE_SERVICE_UUID, PIE_SERVICE_UUID]
       });
       state.ble.device = device;
-      state.ble.name = device.name || 'SG Timer';
+      state.ble.name = device.name || 'Tidtagare';
       device.addEventListener('gattserverdisconnected', bleHandleDisconnect);
 
       bleSetStatus('Ansluter till ' + state.ble.name + '…', '');
       var server = await device.gatt.connect();
       state.ble.server = server;
 
-      var service = await server.getPrimaryService(BLE_SERVICE_UUID);
+      var service = null;
+      try{ service = await server.getPrimaryService(BLE_SERVICE_UUID); state.ble.protocol = 'sg'; }catch(e){ /* inte en SG-timer */ }
+      if(!service){
+        try{ service = await server.getPrimaryService(PIE_SERVICE_UUID); state.ble.protocol = 'pie'; }catch(e){ /* inte heller PIE */ }
+      }
+      if(!service){
+        throw new Error('Ingen känd tidtagartjänst hittades på enheten');
+      }
 
-      var eventChar = await service.getCharacteristic(BLE_CHAR_EVENT);
-      await eventChar.startNotifications();
-      eventChar.addEventListener('characteristicvaluechanged', bleHandleEvent);
-      state.ble.eventChar = eventChar;
+      if(state.ble.protocol === 'sg'){
+        var eventChar = await service.getCharacteristic(BLE_CHAR_EVENT);
+        await eventChar.startNotifications();
+        eventChar.addEventListener('characteristicvaluechanged', bleHandleSgEvent);
+        state.ble.eventChar = eventChar;
 
-      try{
-        state.ble.commandChar = await service.getCharacteristic(BLE_CHAR_COMMAND);
-      }catch(e){ /* valfritt */ }
+        try{
+          state.ble.commandChar = await service.getCharacteristic(BLE_CHAR_COMMAND);
+        }catch(e){ /* valfritt */ }
 
-      // Synka klockan på tidtagaren med telefonens tid
-      try{
-        var unixChar = await service.getCharacteristic(BLE_CHAR_UNIX_TIME);
-        var buf = new ArrayBuffer(4);
-        new DataView(buf).setUint32(0, Math.floor(Date.now() / 1000), false);
-        await unixChar.writeValue(buf);
-      }catch(e){ /* valfritt, fortsätt ändå */ }
+        // Synka klockan på tidtagaren med telefonens tid
+        try{
+          var unixChar = await service.getCharacteristic(BLE_CHAR_UNIX_TIME);
+          var buf = new ArrayBuffer(4);
+          new DataView(buf).setUint32(0, Math.floor(Date.now() / 1000), false);
+          await unixChar.writeValue(buf);
+        }catch(e){ /* valfritt, fortsätt ändå */ }
+      } else {
+        var notifyChar = await service.getCharacteristic(PIE_CHAR_NOTIFY);
+        await notifyChar.startNotifications();
+        notifyChar.addEventListener('characteristicvaluechanged', bleHandlePieEvent);
+        state.ble.eventChar = notifyChar;
+      }
 
       state.ble.connecting = false;
       state.ble.connected = true;
@@ -992,7 +1064,7 @@ if('serviceWorker' in navigator){
       state.ble.sessionLines = [];
       state.ble.pendingShotMs = null;
       state.ble.pendingShotNum = null;
-      bleSetStatus('Ansluten till ' + state.ble.name + ' — redo att ta emot skott', 'good');
+      bleSetStatus('Ansluten till ' + state.ble.name + ' (' + state.ble.protocol.toUpperCase() + ') — redo att ta emot skott', 'good');
     }catch(err){
       state.ble.connecting = false;
       state.ble.connected = false;
@@ -1202,7 +1274,7 @@ if('serviceWorker' in navigator){
       return '' +
         '<div class="pcc-ble-section">' +
           '<button type="button" class="pcc-ble-btn" onclick="pccBleConnect()" ' + (ble.connecting?'disabled':'') + '>' +
-            (ble.connecting ? 'Ansluter…' : '⏱ Anslut till Timer') +
+            (ble.connecting ? 'Ansluter…' : '⏱ Anslut till Timer (SG / PIE)') +
           '</button>' +
           (ble.status ? '<div class="pcc-ble-row"><div class="' + dotCls + '"></div><div class="' + statusCls + '">' + escapeHtml(ble.status) + '</div></div>' : '') +
         '</div>';
@@ -1212,7 +1284,7 @@ if('serviceWorker' in navigator){
       '<div class="pcc-ble-section">' +
         '<div class="pcc-ble-row">' +
           '<div class="' + dotCls + '"></div>' +
-          '<div class="' + statusCls + '">' + escapeHtml(ble.status || ('Ansluten till ' + ble.name)) + '</div>' +
+          '<div class="' + statusCls + '">' + escapeHtml(ble.status || ('Ansluten till ' + ble.name + (ble.protocol ? ' (' + ble.protocol.toUpperCase() + ')' : ''))) + '</div>' +
         '</div>' +
         bleSessionLinesHtml() +
         (ble.commandChar ? (
