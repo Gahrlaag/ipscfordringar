@@ -1,7 +1,7 @@
 // Enkel offline-cache för Fordringar-appen.
 // Höj CACHE_NAME (t.ex. till v2) när du gör en ny version av index.html
 // för att tvinga fram en uppdatering hos användarna.
-const CACHE_NAME = 'fordringar-cache-v4';
+const CACHE_NAME = 'fordringar-cache-v5';
 const ASSETS = [
   './',
   './index.html',
