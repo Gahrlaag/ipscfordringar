@@ -1013,8 +1013,11 @@ if('serviceWorker' in navigator){
     state.ble.connecting = true;
     bleSetStatus('Söker efter tidtagare…', '');
     try{
+      // Vissa timers (t.ex. SpecialPie) annonserar inte sin tjänst-UUID förrän man kopplat upp,
+      // så ett tjänstefilter hittar dem aldrig i enhetslistan. Visa alla BLE-enheter istället —
+      // optionalServices ger oss ändå åtkomst till rätt tjänst efter att en enhet valts.
       var device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [BLE_SERVICE_UUID] }, { services: [PIE_SERVICE_UUID] }],
+        acceptAllDevices: true,
         optionalServices: [BLE_SERVICE_UUID, PIE_SERVICE_UUID]
       });
       state.ble.device = device;
