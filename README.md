@@ -6,7 +6,8 @@ Ett digitalt poängkort för IPSC-fordringarna (PCC, Handgun, Shotgun, Rifle). I
 - Räknar hitfactor live och visar om du klarar silver, guld eller elit
 - Visar marginalen till maxtiden för silver medan du skjuter
 - Håller koll på flera skyttar samtidigt, var och en med sina egna serier per gren och avstånd
-- Bygger en sammanfattning i slutet av dagen — vem som klarat vad — klar att kopiera eller mejla
+- Bygger en sammanfattning i slutet av dagen — vem som klarat vad — klar att kopiera eller maila
+- Möjlighet att ansluta SG- eller PIE timer för att mata in tiden automatiskt.
 
 <img src="screenshot.png" alt="Skärmdump av appen" width="320">
 
